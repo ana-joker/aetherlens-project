@@ -3,7 +3,7 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches:
-      - master # هذا صحيح بناءً على صورتك
+      - master # أو main، حسب الفرع الافتراضي لمستودعك
 
 jobs:
   build-and-deploy:
@@ -25,6 +25,14 @@ jobs:
         run: npm run build
         env:
           VITE_GEMINI_API_KEY: ${{ secrets.VITE_GEMINI_API_KEY }}
+
+      - name: List dist directory contents
+        run: |
+          echo "Listing contents of dist directory:"
+          ls -R dist/
+          echo "Content of dist/index.html:"
+          cat dist/index.html
+        # هذه الخطوة ستعرض محتويات مجلد dist وملف index.html بعد البناء
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
