@@ -1,16 +1,61 @@
-
-import { GoogleGenAI, GenerateContentResponse, Type } from "@google/genai";
+import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
 import type { AspectRatio, Persona, EditableImage } from '../types';
 
-if (!process.env.API_KEY) {
-  // This key is for client-side calls that are still being made (e.g., enhance prompt).
-  // The backend for identity generation would have its own key, or preferably,
-  // ALL calls would go through a backend to hide the key.
-  // We leave this for the remaining direct calls.
-  console.warn("API_KEY environment variable not set for client-side operations.");
+// Access API key using import.meta.env for Vite applications
+const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
+
+// Initialize GoogleGenAI with the correctly accessed API key
+const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+// Helper function for Exponential Backoff Retry Logic for Gemini API calls
+async function callGeminiApiWithRetry<T>(
+  apiCall: () => Promise<T>,
+  retries = 3,
+  delay = 1000
+): Promise<T> {
+  try {
+    return await apiCall();
+  } catch (error: any) {
+    // Check for rate limit error (status 429) or network errors
+    if ((error.status === 429 || error.message.includes("Network Error")) && retries > 0) {
+      console.warn(`API call failed (Status: ${error.status || 'Network Error'}). Retrying in ${delay / 1000} seconds...`);
+      await new Promise(res => setTimeout(res, delay));
+      return callGeminiApiWithRetry(apiCall, retries - 1, delay * 2); // Exponential backoff
+    }
+    throw error; // Re-throw other errors or if no retries left
+  }
 }
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// Helper function for Exponential Backoff Retry Logic for standard fetch calls
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  retries = 3,
+  delay = 1000
+): Promise<Response> {
+  try {
+    const response = await fetch(url, options);
+    if (response.status === 429 && retries > 0) {
+      console.warn(`Rate limit hit for ${url}. Retrying in ${delay / 1000} seconds...`);
+      await new Promise(res => setTimeout(res, delay));
+      return fetchWithRetry(url, options, retries - 1, delay * 2);
+    }
+    if (!response.ok && retries > 0) { // Also retry on non-OK responses if not 429
+        console.warn(`Fetch failed for ${url} (Status: ${response.status}). Retrying in ${delay / 1000} seconds...`);
+        await new Promise(res => setTimeout(res, delay));
+        return fetchWithRetry(url, options, retries - 1, delay * 2);
+    }
+    return response;
+  } catch (error) {
+    if (retries > 0) { // Also retry on network errors
+      console.warn(`Network error for ${url}. Retrying in ${delay / 1000} seconds...`);
+      await new Promise(res => setTimeout(res, delay));
+      return fetchWithRetry(url, options, retries - 1, delay * 2);
+    }
+    throw error;
+  }
+}
+
 
 export const generateImages = async (
   prompt: string,
@@ -18,15 +63,17 @@ export const generateImages = async (
   aspectRatio: '1:1' | '16:9' | '9:16' | '4:3' | '3:4'
 ) => {
   try {
-    const response = await ai.models.generateImages({
-      model: 'imagen-3.0-generate-002',
-      prompt,
-      config: {
-        numberOfImages,
-        outputMimeType: 'image/jpeg',
-        aspectRatio,
-      },
-    });
+    const response = await callGeminiApiWithRetry(() =>
+      ai.models.generateImages({
+        model: 'imagen-3.0-generate-002',
+        prompt,
+        config: {
+          numberOfImages,
+          outputMimeType: 'image/jpeg',
+          aspectRatio,
+        },
+      })
+    );
 
     return response.generatedImages.map(
       (img) => `data:image/jpeg;base64,${img.image.imageBytes}`
@@ -52,14 +99,16 @@ export const enhancePrompt = async (prompt: string) => {
     - For example, if the user prompt is "a knight in a forest", a good enhanced prompt would be: "An epic cinematic shot of a lone knight in weathered steel armor, standing amidst a misty, ancient redwood forest. Sunbeams pierce through the dense canopy, illuminating dust motes in the air. Close-up on the knight's determined face, a single scar across his cheek. Photorealistic, 8K, dramatic lighting."`;
     
     try {
-        const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: prompt,
-            config: {
-                systemInstruction,
-                thinkingConfig: { thinkingBudget: 0 } // For faster response
-            }
-        });
+        const response = await callGeminiApiWithRetry(() =>
+            ai.models.generateContent({
+                model: "gemini-2.5-flash",
+                contents: prompt,
+                config: {
+                    systemInstruction,
+                    thinkingConfig: { thinkingBudget: 0 }
+                }
+            })
+        );
         return response.text.trim();
     } catch (error) {
         console.error("Error enhancing prompt:", error);
@@ -73,14 +122,16 @@ export const enhancePrompt = async (prompt: string) => {
 export const generateRandomPrompt = async () => {
     const systemInstruction = `You are an idea generator for an AI artist. Generate a single, random, creative, and visually interesting prompt for an AI image generator. The prompt should be a short phrase or sentence. Do not add any preamble or explanation. Just return the prompt. Examples: "a crystal fox drinking from a bioluminescent river", "a steampunk library on Mars", "a knight made of constellations".`;
     try {
-        const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: "Generate a new prompt.",
-            config: {
-                systemInstruction,
-                thinkingConfig: { thinkingBudget: 0 }
-            }
-        });
+        const response = await callGeminiApiWithRetry(() =>
+            ai.models.generateContent({
+                model: "gemini-2.5-flash",
+                contents: "Generate a new prompt.",
+                config: {
+                    systemInstruction,
+                    thinkingConfig: { thinkingBudget: 0 }
+                }
+            })
+        );
         return response.text.trim();
     } catch (error) {
         console.error("Error generating random prompt:", error);
@@ -103,10 +154,12 @@ export const describeImage = async (base64Image: string, mimeType: string) => {
             text: "Analyze this image in detail. Generate a rich, descriptive prompt that could be used to recreate it with an AI image generator. Focus on subject, setting, style, composition, lighting, and mood. The output should be a single, cohesive, and powerful prompt string. Do NOT add any preamble or explanation.",
         };
 
-        const response: GenerateContentResponse = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: { parts: [imagePart, textPart] },
-        });
+        const response: GenerateContentResponse = await callGeminiApiWithRetry(() =>
+            ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: { parts: [imagePart, textPart] },
+            })
+        );
 
         return response.text.trim();
     } catch (error) {
@@ -130,11 +183,13 @@ export const reimaginePromptFromImages = async (base64Images: {data: string, mim
         
         const textPart = { text: `User request: "${userPrompt}"` };
 
-        const response: GenerateContentResponse = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: { parts: [...imageParts, textPart] },
-            config: { systemInstruction }
-        });
+        const response: GenerateContentResponse = await callGeminiApiWithRetry(() =>
+            ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: { parts: [...imageParts, textPart] },
+                config: { systemInstruction }
+            })
+        );
         
         return response.text.trim();
 
@@ -158,11 +213,13 @@ export const createUpscalePrompt = async (base64Image: string, mimeType: string)
         
         const textPart = { text: "Analyze and create an upscale prompt for this image." };
 
-        const response: GenerateContentResponse = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: { parts: [imagePart, textPart] },
-            config: { systemInstruction }
-        });
+        const response: GenerateContentResponse = await callGeminiApiWithRetry(() =>
+            ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: { parts: [imagePart, textPart] },
+                config: { systemInstruction }
+            })
+        );
         
         return response.text.trim();
 
@@ -218,7 +275,7 @@ export const generateIdentity = async (
 
         // This endpoint is hypothetical and assumes a backend server is running.
         // The backend should handle file parsing, face embedding, and image generation.
-        const response = await fetch('/api/generate-identity', {
+        const response = await fetchWithRetry('/api/generate-identity', {
             method: 'POST',
             body: formData,
             // Note: Don't set 'Content-Type' header manually for FormData,
